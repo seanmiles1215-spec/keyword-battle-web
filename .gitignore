@@ -1,0 +1,16 @@
+# Secrets and local environment
+.env
+.env.*
+**/.env
+**/.env.*
+密钥库.md
+*密钥*.md
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local and generated files
+.DS_Store
+node_modules/
+*.log
