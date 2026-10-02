@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+test-results/
+playwright-report/
+.env
+.env.*
+!.env.example
+**/《密钥库.md》
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
