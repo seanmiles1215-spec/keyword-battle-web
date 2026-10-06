@@ -29,6 +29,8 @@ export interface SetPreflightParametersInput {
 }
 
 export interface ConfirmKeywordTaskInput {
+  taskId: string;
+  objectPath: string;
   sessionId: string;
   fileHash: string;
   preflightHash: string;
@@ -38,6 +40,17 @@ export interface ConfirmKeywordTaskInput {
   snapshotVersion: string;
   quoteId: string;
   quoteHash: string;
+}
+
+const DIRECT_TASK_FIELDS = "id,upload_session_id,fee_quote_id,fee_quote_hash,confirmation_idempotency_key,report_file_path,status,task_status";
+const TASK_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+function sameDirectTask(value: unknown, input: ConfirmKeywordTaskInput): boolean {
+  const row = value as Record<string, unknown> | null;
+  return !!row && row.id === input.taskId && row.upload_session_id === input.sessionId
+    && row.fee_quote_id === input.quoteId && row.fee_quote_hash === input.quoteHash
+    && row.confirmation_idempotency_key === input.idempotencyKey.trim()
+    && row.report_file_path === input.objectPath && row.status === "新版工作台";
 }
 
 export interface SupabaseSubmissionService {
@@ -209,24 +222,44 @@ export function createSupabaseServices({
       return data;
     },
     async confirmKeywordTask(input) {
-      const { data, error } = await transportBound(
-        () => client.rpc("confirm_keyword_task_v3", {
-          p_upload_session_id: input.sessionId,
-          p_file_hash: input.fileHash,
-          p_preflight_hash: input.preflightHash,
-          p_idempotency_key: input.idempotencyKey,
-          p_asin: input.asin,
-          p_analysis_version: input.analysisVersion,
-          p_snapshot_version: input.snapshotVersion,
-          p_quote_id: input.quoteId,
-          p_quote_hash: input.quoteHash,
-        }),
-        "CONFIRMATION_TRANSPORT_LOST",
-        true,
-      );
-      if (error) throw classifiedRpcError(error, "CONFIRMATION_TRANSPORT_LOST", true);
-      if (typeof data !== "string" || data === "") throw new SubmissionError("CONFIRMATION_OUTCOME_UNKNOWN", "network", true);
-      return data;
+      if (!TASK_UUID.test(input.taskId) || !TASK_UUID.test(input.sessionId)
+        || !TASK_UUID.test(input.quoteId) || !/^[0-9a-f]{64}$/u.test(input.quoteHash)
+        || !input.objectPath || !input.idempotencyKey.trim()) {
+        throw new SubmissionError("INVALID_REQUEST", "validation");
+      }
+      const readback = async () => {
+        try {
+          const { data, error } = await client.from("keyword_tasks")
+            .select(DIRECT_TASK_FIELDS).eq("id", input.taskId).maybeSingle();
+          return error ? null : data;
+        } catch { return null; }
+      };
+      let inserted: unknown;
+      let failure: SubmissionError | null = null;
+      try {
+        const { data, error } = await transportBound(
+          () => client.from("keyword_tasks").insert({
+            id: input.taskId,
+            upload_session_id: input.sessionId,
+            fee_quote_id: input.quoteId,
+            fee_quote_hash: input.quoteHash,
+            confirmation_idempotency_key: input.idempotencyKey.trim(),
+          }).select(DIRECT_TASK_FIELDS).single(),
+          "CONFIRMATION_TRANSPORT_LOST", true,
+        );
+        if (error) failure = classifiedRpcError(error, "CONFIRMATION_TRANSPORT_LOST", true);
+        else inserted = data;
+      } catch (error) {
+        failure = error instanceof SubmissionError ? error
+          : new SubmissionError("CONFIRMATION_TRANSPORT_LOST", "network", true);
+      }
+      if (sameDirectTask(inserted, input)) return input.taskId;
+      if (!failure || failure.ambiguous || ["23505", "55000"].includes(failure.code)) {
+        const recovered = await readback();
+        if (sameDirectTask(recovered, input)) return input.taskId;
+        if (recovered) throw new SubmissionError("CONFIRMATION_IDENTITY_CONFLICT", "validation");
+      }
+      throw failure ?? new SubmissionError("CONFIRMATION_OUTCOME_UNKNOWN", "network", true);
     },
     async cancelUploadSession(sessionId) {
       const { data, error } = await transportBound(

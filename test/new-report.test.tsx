@@ -96,7 +96,7 @@ function services(overrides: ServiceOverrides = {}): WebServices {
       createUploadSession: vi.fn().mockResolvedValue({
         sessionId: SESSION_ID,
         bucket: "private-inbox",
-        path: "workspaces/server-selected/report.xlsx",
+        path: `${session.user.id}/${TASK_ID}.csv`,
         token: "one-time-upload-token",
         expiresAt: EXPIRES_AT,
       }),
@@ -114,6 +114,7 @@ function services(overrides: ServiceOverrides = {}): WebServices {
     },
     hashFile: vi.fn().mockResolvedValue(FILE_HASH),
     createIdempotencyKey: vi.fn(() => "client-confirmation-key"),
+    createTaskId: vi.fn(() => TASK_ID),
     createFeeQuoteRequestId: vi.fn(() => FEE_REQUEST_ID),
     workbench: {
       getTaskCostSummary: vi.fn(), resolveActiveReportId: vi.fn(), getReportWorkbench: vi.fn(), assignActionOwner: vi.fn(),
@@ -212,15 +213,77 @@ describe("authenticated report submission", () => {
       originalFilename: "report.csv",
       fileHash: FILE_HASH,
       uploadPurpose: "初始分析",
+      taskId: TASK_ID,
+      asin: "B0ABC12345",
+      marketplace: "US",
     });
     expect(service.supabase.uploadToSignedUrl).toHaveBeenCalledWith({
       bucket: "private-inbox",
-      path: "workspaces/server-selected/report.xlsx",
+      path: `${session.user.id}/${TASK_ID}.csv`,
       token: "one-time-upload-token",
       file,
       upsert: false,
     });
     expect(service.api.runPreflight).toHaveBeenCalledWith(SESSION_ID);
+  });
+
+  it("shows a one-ASIN declaration and its source after preflight", async () => {
+    const user = userEvent.setup();
+    const service = services({ api: { runPreflight: vi.fn().mockResolvedValue({
+      ...feeDialog, asinSource: "user_declared", marketplaceSource: "user_declared",
+    }) } });
+    renderRoute(service);
+    await selectValidReport(user);
+    expect(screen.getByText(/整份报表仅属于所填 ASIN/u)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "运行免费预检" }));
+    expect(await screen.findByText(/ASIN B0ABC12345、US（用户声明）/u)).toBeVisible();
+  });
+
+  it("normalizes a lowercase ASIN with surrounding whitespace before opening an initial session", async () => {
+    const user = userEvent.setup();
+    const service = services();
+    renderRoute(service);
+    await screen.findByRole("heading", { name: "新建关键词分析报告" });
+    await user.type(screen.getByLabelText("工作区 ID"), WORKSPACE_ID);
+    await user.type(screen.getByLabelText("ASIN"), " b0abc12345 ");
+    await user.upload(screen.getByLabelText("广告报告文件"), new File(["keyword"], "report.csv", { type: "text/csv" }));
+    await user.click(screen.getByRole("button", { name: "运行免费预检" }));
+    await screen.findByRole("heading", { name: "费用与口径确认" });
+    expect(service.api.createUploadSession).toHaveBeenCalledWith(expect.objectContaining({
+      asin: "B0ABC12345", marketplace: "US",
+    }));
+  });
+
+  it("rejects a refreshed quote whose persisted source no longer matches the initial declaration", async () => {
+    const user = userEvent.setup();
+    const service = services({ api: {
+      runPreflight: vi.fn().mockResolvedValue({
+        ...feeDialog, asinSource: "user_declared", marketplaceSource: "user_declared",
+      }),
+      refreshFeeQuote: vi.fn().mockResolvedValue({
+        ...feeDialog, asinSource: "report", marketplaceSource: "user_declared", feeQuote: readyQuote,
+      }),
+    } });
+    await runPreflight(user, service);
+    await user.click(screen.getByRole("button", { name: "确认分析口径" }));
+    expect((await screen.findAllByRole("alert")).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "确认费用并开始分析" })).toBeDisabled();
+    expect(service.supabase.confirmKeywordTask).not.toHaveBeenCalled();
+  });
+
+  it("rejects a signed path outside the exact user/task object before uploading", async () => {
+    const user = userEvent.setup();
+    const service = services({ api: { createUploadSession: vi.fn().mockResolvedValue({
+      sessionId: SESSION_ID, bucket: "private-inbox", path: "someone-else/report.csv",
+      token: "one-time-token", expiresAt: EXPIRES_AT,
+    }) } });
+    renderRoute(service);
+    await selectValidReport(user);
+    await user.click(screen.getByRole("button", { name: "运行免费预检" }));
+    expect(await screen.findByRole("alert")).toBeVisible();
+    expect(service.supabase.uploadToSignedUrl).not.toHaveBeenCalled();
+    expect(service.api.runPreflight).not.toHaveBeenCalled();
+    expect(service.supabase.confirmKeywordTask).not.toHaveBeenCalled();
   });
 
   it("rejects an entered ASIN that differs from the persisted detected ASIN before fee confirmation", async () => {
@@ -252,6 +315,8 @@ describe("authenticated report submission", () => {
     expect(new Set(calls.map(([input]) => input.idempotencyKey)).size).toBe(1);
     expect(calls[0]?.[0]).toMatchObject({
       sessionId: SESSION_ID,
+      taskId: TASK_ID,
+      objectPath: `${session.user.id}/${TASK_ID}.csv`,
       fileHash: FILE_HASH,
       preflightHash: PREFLIGHT_HASH,
       idempotencyKey: "client-confirmation-key",
@@ -260,6 +325,7 @@ describe("authenticated report submission", () => {
       quoteHash: readyQuote.quoteHash,
     });
     expect(service.createIdempotencyKey).toHaveBeenCalledTimes(1);
+    expect(service.createTaskId).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("button", { name: "确认费用并开始分析" })).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "打开任务工作台" }))
       .toHaveAttribute("href", `/tasks/${TASK_ID}/workbench`);

@@ -496,6 +496,7 @@ describe("dynamic two-layer workbench", () => {
       supabase: {} as WebServices["supabase"],
       workbench: workbenchServices(),
       hashFile: vi.fn(),
+      createTaskId: vi.fn(),
       createIdempotencyKey: vi.fn(),
       createFeeQuoteRequestId: vi.fn(),
     } satisfies WebServices;

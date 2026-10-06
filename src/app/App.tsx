@@ -13,6 +13,7 @@ export interface WebServices {
   api: ApiService;
   supabase: SupabaseSubmissionService;
   hashFile: (file: File) => Promise<string>;
+  createTaskId: () => string;
   createIdempotencyKey: () => string;
   createFeeQuoteRequestId: () => string;
   workbench: WorkbenchPageServices;

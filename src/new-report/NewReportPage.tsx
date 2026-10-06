@@ -31,12 +31,15 @@ export interface NewReportServices {
   api: ApiService;
   supabase: SupabaseSubmissionService;
   hashFile: (file: File) => Promise<string>;
+  createTaskId: () => string;
   createIdempotencyKey: () => string;
   createFeeQuoteRequestId: () => string;
 }
 
 interface UploadContext {
   sessionId: string;
+  taskId: string;
+  objectPath: string;
   expiresAt: string;
   fileHash: string;
 }
@@ -74,6 +77,18 @@ function parametersComplete(parameters: ConfirmationParameters) {
     && Number.isInteger(attributionDays) && attributionDays > 0
     && parameters.attributionMetricGroup.trim() !== ""
     && Number.isFinite(targetAcos) && targetAcos > 0 && targetAcos <= 1;
+}
+
+function reportIdentityLabel(preflight: PreflightFeeDialog) {
+  if (preflight.asinSource === "user_declared" && preflight.marketplaceSource === "user_declared") {
+    return `ASIN ${preflight.asin}、US（用户声明）`;
+  }
+  if (preflight.asinSource && preflight.marketplaceSource) {
+    const asinSource = preflight.asinSource === "report" ? "报表逐行核对" : "用户声明";
+    const marketplaceSource = preflight.marketplaceSource === "report" ? "报表逐行核对" : "用户声明";
+    return `ASIN ${preflight.asin}（${asinSource}）、US（${marketplaceSource}）`;
+  }
+  return `ASIN ${preflight.asin}、US（历史预检）`;
 }
 
 export function NewReportPage({ services, viewerUserId }: { services: NewReportServices; viewerUserId: string }) {
@@ -129,6 +144,12 @@ export function NewReportPage({ services, viewerUserId }: { services: NewReportS
       const latest = currentQuoteRequestKey(request.requestId);
       if (!latest || !sameQuoteRequest(request, latest)
         || !quoteRequest.current || !sameQuoteRequest(request, quoteRequest.current)) return;
+      if (!preflight || refreshedDialog.asin !== preflight.asin
+        || refreshedDialog.marketplace !== preflight.marketplace
+        || refreshedDialog.asinSource !== preflight.asinSource
+        || refreshedDialog.marketplaceSource !== preflight.marketplaceSource) {
+        throw new SubmissionError("FEE_SOURCE_MISMATCH", "validation");
+      }
       setPreflight(refreshedDialog);
       const quote = refreshedDialog.feeQuote;
       if (quote.state === "unavailable") {
@@ -223,6 +244,9 @@ export function NewReportPage({ services, viewerUserId }: { services: NewReportS
       return;
     }
     const selectedFile = file as File;
+    const nextTaskId = services.createTaskId();
+    const suffix = selectedFile.name.toLowerCase().endsWith(".xlsx") ? ".xlsx" : ".csv";
+    const expectedPath = `${viewerUserId}/${nextTaskId}${suffix}`;
     setPhase("working");
     setErrorMessage(null);
     try {
@@ -232,8 +256,13 @@ export function NewReportPage({ services, viewerUserId }: { services: NewReportS
         originalFilename: selectedFile.name,
         fileHash,
         uploadPurpose: "初始分析",
+        taskId: nextTaskId,
+        asin: asin.trim().toUpperCase(),
+        marketplace: "US",
       });
-      const uploadContext = { sessionId: signed.sessionId, expiresAt: signed.expiresAt, fileHash };
+      if (signed.path !== expectedPath) throw new SubmissionError("UPLOAD_PATH_MISMATCH", "validation");
+      const uploadContext = { sessionId: signed.sessionId, taskId: nextTaskId,
+        objectPath: signed.path, expiresAt: signed.expiresAt, fileHash };
       uploadRef.current = uploadContext;
       setUpload(uploadContext);
       await services.supabase.uploadToSignedUrl({
@@ -246,7 +275,9 @@ export function NewReportPage({ services, viewerUserId }: { services: NewReportS
       const result = await services.api.runPreflight(signed.sessionId);
       if (result.asin !== asin.trim().toUpperCase()) {
         setPhase("form");
-        setErrorMessage("文件检测到的 ASIN 与输入 ASIN 不一致，未进入费用确认。");
+        setErrorMessage(result.asinSource === "user_declared"
+          ? "预检返回的 ASIN 与用户声明不一致，未进入费用确认。"
+          : "文件检测到的 ASIN 与输入 ASIN 不一致，未进入费用确认。");
         return;
       }
       const nextParameters = initialParameters(result);
@@ -326,6 +357,8 @@ export function NewReportPage({ services, viewerUserId }: { services: NewReportS
     try {
       const nextTaskId = await services.supabase.confirmKeywordTask({
         sessionId: upload.sessionId,
+        taskId: upload.taskId,
+        objectPath: upload.objectPath,
         fileHash: upload.fileHash,
         preflightHash,
         idempotencyKey: key,
@@ -427,6 +460,7 @@ export function NewReportPage({ services, viewerUserId }: { services: NewReportS
               <span>.xlsx / .csv，最大 20 MB</span>
             </div>
           </div>
+          <p className="notice">整份报表仅属于所填 ASIN、美国站；无 ASIN 或站点列时按此声明归属，请先核实再上传。</p>
           <button className="primary" type="submit" disabled={phase !== "form"}>运行免费预检</button>
         </form>
       ) : null}
@@ -436,6 +470,7 @@ export function NewReportPage({ services, viewerUserId }: { services: NewReportS
 
       {phase === "preflight" && upload && preflight ? (
         <>
+          <p className="notice" role="status">{reportIdentityLabel(preflight)}</p>
           <CostConfirmationDialog
             preflight={preflight}
             feeQuoteState={feeQuoteState}

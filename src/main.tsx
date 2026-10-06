@@ -29,6 +29,7 @@ const services: WebServices = {
   }),
   hashFile,
   createIdempotencyKey: () => crypto.randomUUID(),
+  createTaskId: () => crypto.randomUUID(),
   createFeeQuoteRequestId: () => crypto.randomUUID(),
 };
 

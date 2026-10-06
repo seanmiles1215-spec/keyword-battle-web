@@ -45,6 +45,8 @@ export interface AttributionMetricGroup {
 
 interface PreflightFeeDialogBase {
   asin: string;
+  asinSource?: "user_declared" | "report";
+  marketplaceSource?: "user_declared" | "report";
   periodStart: string | null;
   periodEnd: string | null;
   periodDays: number | null;
@@ -80,7 +82,18 @@ export interface ApiService {
     workspaceId: string;
     originalFilename: string;
     fileHash: string;
-    uploadPurpose: "初始分析" | "复盘数据";
+    uploadPurpose: "初始分析";
+    taskId: string;
+    asin: string;
+    marketplace: "US";
+  } | {
+    workspaceId: string;
+    originalFilename: string;
+    fileHash: string;
+    uploadPurpose: "复盘数据";
+    taskId?: never;
+    asin?: never;
+    marketplace?: never;
   }): Promise<UploadSessionResponse>;
   runPreflight(sessionId: string): Promise<PreflightFeeDialog>;
   refreshFeeQuote(input: { sessionId: string; requestId: string }): Promise<V2PreflightFeeDialog>;
@@ -198,7 +211,8 @@ function validMetricGroups(value: unknown): value is AttributionMetricGroup[] {
 
 const FEE_DIALOG_BASE_KEYS = ["asin", "periodStart", "periodEnd", "periodDays", "marketplace", "currency",
   "reportType", "attributionDaysCandidates", "attributionMetricGroups", "estimatedKeywordCount",
-  "manualExecutionScopeRequired", "preflightStatus", "preflightBlockers", "preflightWarnings"] as const;
+  "manualExecutionScopeRequired", "preflightStatus", "preflightBlockers", "preflightWarnings",
+  "asinSource", "marketplaceSource"] as const;
 
 function requireFeeDialog(value: unknown): PreflightFeeDialog {
   const candidate = value as Record<string, unknown> | null;
@@ -218,6 +232,9 @@ function requireFeeDialog(value: unknown): PreflightFeeDialog {
     || !Array.isArray(candidate.preflightWarnings)
     || candidate.preflightWarnings.some((item) => typeof item !== "string")
     || !["可确认", "需补口径"].includes(String(candidate.preflightStatus))
+    || ((candidate.asinSource === undefined) !== (candidate.marketplaceSource === undefined))
+    || (candidate.asinSource !== undefined && !["user_declared", "report"].includes(String(candidate.asinSource)))
+    || (candidate.marketplaceSource !== undefined && !["user_declared", "report"].includes(String(candidate.marketplaceSource)))
     || !record(candidate.calculationBasis)) {
     throw new SubmissionError("INVALID_API_RESPONSE", "network");
   }
@@ -326,6 +343,11 @@ export function createApiService({
   return {
     async createUploadSession(input) {
       if (!UUID.test(input.workspaceId) || !SHA256.test(input.fileHash)) {
+        throw new SubmissionError("INVALID_REQUEST", "validation");
+      }
+      if (input.uploadPurpose === "初始分析" ? !UUID.test(input.taskId)
+        || !/^B0[A-Z0-9]{8}$/u.test(input.asin) || input.marketplace !== "US"
+        : input.taskId !== undefined || input.asin !== undefined || input.marketplace !== undefined) {
         throw new SubmissionError("INVALID_REQUEST", "validation");
       }
       return requireUploadSession(await request("/v1/upload-sessions", {

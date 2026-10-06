@@ -6,18 +6,39 @@ import { createSupabaseServices } from "../src/lib/supabase";
 const SESSION_ID = "81000000-0000-0000-0000-000000000001";
 const QUOTE_ID = "82000000-0000-0000-0000-000000000001";
 const QUOTE_HASH = "c".repeat(64);
+const TASK_ID = "61000000-0000-0000-0000-000000000001";
+const OBJECT_PATH = `11000000-0000-0000-0000-000000000001/${TASK_ID}.csv`;
+const CONFIRM_INPUT = { taskId: TASK_ID, objectPath: OBJECT_PATH,
+  sessionId: SESSION_ID, fileHash: "b".repeat(64), preflightHash: "a".repeat(64),
+  idempotencyKey: "one-client-confirmation", asin: "B0ABC12345",
+  analysisVersion: "analysis-v1", snapshotVersion: "snapshot-v1",
+  quoteId: QUOTE_ID, quoteHash: QUOTE_HASH };
+const CONFIRMED_ROW = { id: TASK_ID, upload_session_id: SESSION_ID,
+  fee_quote_id: QUOTE_ID, fee_quote_hash: QUOTE_HASH,
+  confirmation_idempotency_key: "one-client-confirmation", report_file_path: OBJECT_PATH,
+  status: "新版工作台", task_status: "排队" };
 
 function fakeClient({
   uploadToSignedUrl = vi.fn().mockResolvedValue({ data: { path: "server/report.csv" }, error: null }),
   rpc = vi.fn().mockResolvedValue({ data: true, error: null }),
+  insertOutcome = { data: CONFIRMED_ROW, error: null } as unknown,
+  readOutcome = { data: null, error: null } as unknown,
 } = {}) {
-  const from = vi.fn(() => ({ uploadToSignedUrl }));
+  const insertSingle = vi.fn(async () => {
+    if (insertOutcome instanceof Error) throw insertOutcome;
+    return insertOutcome;
+  });
+  const taskInsert = vi.fn(() => ({ select: vi.fn(() => ({ single: insertSingle })) }));
+  const taskRead = vi.fn(() => ({ eq: vi.fn(() => ({ maybeSingle: vi.fn(async () => readOutcome) })) }));
+  const from = vi.fn((table: string) => table === "keyword_tasks"
+    ? { insert: taskInsert, select: taskRead } : { uploadToSignedUrl });
   const client = {
     auth: {},
     storage: { from },
+    from,
     rpc,
   } as unknown as SupabaseClient;
-  return { client, from, uploadToSignedUrl, rpc };
+  return { client, from, uploadToSignedUrl, rpc, taskInsert, taskRead };
 }
 
 describe("Supabase browser adapter", () => {
@@ -54,13 +75,11 @@ describe("Supabase browser adapter", () => {
     );
   });
 
-  it("maps parameter lock, atomic confirmation, and controlled cancellation to reviewed RPCs", async () => {
+  it("maps parameter lock and cancellation to RPCs, but confirmation to direct INSERT", async () => {
     const rpc = vi.fn(async (name: string) => ({
       data: name === "set_preflight_parameters"
         ? "a".repeat(64)
-        : name === "confirm_keyword_task_v3"
-          ? "61000000-0000-0000-0000-000000000001"
-          : true,
+        : true,
       error: null,
     }));
     const harness = fakeClient({ rpc });
@@ -81,17 +100,7 @@ describe("Supabase browser adapter", () => {
       attributionMetricGroup: "sp-sales-orders-14d",
       targetAcos: "0.30",
     });
-    await supabase.confirmKeywordTask({
-      sessionId: SESSION_ID,
-      fileHash: "b".repeat(64),
-      preflightHash: "a".repeat(64),
-      idempotencyKey: "one-client-confirmation",
-      asin: "B0ABC12345",
-      analysisVersion: "analysis-v1",
-      snapshotVersion: "snapshot-v1",
-      quoteId: QUOTE_ID,
-      quoteHash: QUOTE_HASH,
-    });
+    await supabase.confirmKeywordTask(CONFIRM_INPUT);
     await supabase.cancelUploadSession(SESSION_ID);
 
     expect(rpc).toHaveBeenNthCalledWith(1, "set_preflight_parameters", expect.objectContaining({
@@ -99,12 +108,12 @@ describe("Supabase browser adapter", () => {
       p_target_acos: "0.30",
       p_attribution_metric_group: "sp-sales-orders-14d",
     }));
-    expect(rpc).toHaveBeenNthCalledWith(2, "confirm_keyword_task_v3", expect.objectContaining({
-      p_idempotency_key: "one-client-confirmation",
-      p_quote_id: QUOTE_ID,
-      p_quote_hash: QUOTE_HASH,
-    }));
-    expect(rpc).toHaveBeenNthCalledWith(3, "cancel_upload_session", {
+    expect(harness.taskInsert).toHaveBeenCalledWith({
+      id: TASK_ID, upload_session_id: SESSION_ID,
+      fee_quote_id: QUOTE_ID, fee_quote_hash: QUOTE_HASH,
+      confirmation_idempotency_key: "one-client-confirmation",
+    });
+    expect(rpc).toHaveBeenNthCalledWith(2, "cancel_upload_session", {
       p_upload_session_id: SESSION_ID,
     });
   });
@@ -160,13 +169,13 @@ describe("Supabase browser adapter", () => {
 
   it("treats a returned SQLSTATE confirmation rejection as definitive", async () => {
     const harness = fakeClient({
-      rpc: vi.fn().mockResolvedValue({
+      insertOutcome: {
         data: null,
         error: {
           code: "22023",
           message: "confirmed cost caps must exactly match preflight estimates",
         },
-      }),
+      },
     });
     const { supabase } = createSupabaseServices({
       supabaseUrl: "https://project.supabase.co",
@@ -174,17 +183,7 @@ describe("Supabase browser adapter", () => {
       client: harness.client,
     });
 
-    await expect(supabase.confirmKeywordTask({
-      sessionId: SESSION_ID,
-      fileHash: "b".repeat(64),
-      preflightHash: "a".repeat(64),
-      idempotencyKey: "one-client-confirmation",
-      asin: "B0ABC12345",
-      analysisVersion: "analysis-v1",
-      snapshotVersion: "snapshot-v1",
-      quoteId: QUOTE_ID,
-      quoteHash: QUOTE_HASH,
-    })).rejects.toMatchObject({
+    await expect(supabase.confirmKeywordTask(CONFIRM_INPUT)).rejects.toMatchObject({
       code: "22023",
       kind: "validation",
       ambiguous: false,
@@ -193,13 +192,13 @@ describe("Supabase browser adapter", () => {
 
   it("classifies a returned PostgreSQL transport SQLSTATE without making the outcome ambiguous", async () => {
     const harness = fakeClient({
-      rpc: vi.fn().mockResolvedValue({
+      insertOutcome: {
         data: null,
         error: {
           code: "57014",
           message: "canceling statement due to statement timeout",
         },
-      }),
+      },
     });
     const { supabase } = createSupabaseServices({
       supabaseUrl: "https://project.supabase.co",
@@ -207,17 +206,7 @@ describe("Supabase browser adapter", () => {
       client: harness.client,
     });
 
-    await expect(supabase.confirmKeywordTask({
-      sessionId: SESSION_ID,
-      fileHash: "b".repeat(64),
-      preflightHash: "a".repeat(64),
-      idempotencyKey: "one-client-confirmation",
-      asin: "B0ABC12345",
-      analysisVersion: "analysis-v1",
-      snapshotVersion: "snapshot-v1",
-      quoteId: QUOTE_ID,
-      quoteHash: QUOTE_HASH,
-    })).rejects.toMatchObject({
+    await expect(supabase.confirmKeywordTask(CONFIRM_INPUT)).rejects.toMatchObject({
       code: "57014",
       kind: "network",
       ambiguous: false,
@@ -226,7 +215,7 @@ describe("Supabase browser adapter", () => {
 
   it("marks only a thrown confirmation transport loss as ambiguous", async () => {
     const harness = fakeClient({
-      rpc: vi.fn().mockRejectedValue(new TypeError("response lost")),
+      insertOutcome: new TypeError("response lost"),
     });
     const { supabase } = createSupabaseServices({
       supabaseUrl: "https://project.supabase.co",
@@ -234,17 +223,7 @@ describe("Supabase browser adapter", () => {
       client: harness.client,
     });
 
-    await expect(supabase.confirmKeywordTask({
-      sessionId: SESSION_ID,
-      fileHash: "b".repeat(64),
-      preflightHash: "a".repeat(64),
-      idempotencyKey: "one-client-confirmation",
-      asin: "B0ABC12345",
-      analysisVersion: "analysis-v1",
-      snapshotVersion: "snapshot-v1",
-      quoteId: QUOTE_ID,
-      quoteHash: QUOTE_HASH,
-    })).rejects.toMatchObject({
+    await expect(supabase.confirmKeywordTask(CONFIRM_INPUT)).rejects.toMatchObject({
       code: "CONFIRMATION_TRANSPORT_LOST",
       kind: "network",
       ambiguous: true,
@@ -253,10 +232,10 @@ describe("Supabase browser adapter", () => {
 
   it("marks a Supabase-returned confirmation fetch failure as a possibly lost response", async () => {
     const harness = fakeClient({
-      rpc: vi.fn().mockResolvedValue({
+      insertOutcome: {
         data: null,
         error: { code: "", message: "TypeError: Failed to fetch" },
-      }),
+      },
     });
     const { supabase } = createSupabaseServices({
       supabaseUrl: "https://project.supabase.co",
@@ -264,17 +243,7 @@ describe("Supabase browser adapter", () => {
       client: harness.client,
     });
 
-    await expect(supabase.confirmKeywordTask({
-      sessionId: SESSION_ID,
-      fileHash: "b".repeat(64),
-      preflightHash: "a".repeat(64),
-      idempotencyKey: "one-client-confirmation",
-      asin: "B0ABC12345",
-      analysisVersion: "analysis-v1",
-      snapshotVersion: "snapshot-v1",
-      quoteId: QUOTE_ID,
-      quoteHash: QUOTE_HASH,
-    })).rejects.toMatchObject({
+    await expect(supabase.confirmKeywordTask(CONFIRM_INPUT)).rejects.toMatchObject({
       code: "CONFIRMATION_TRANSPORT_LOST",
       kind: "network",
       ambiguous: true,

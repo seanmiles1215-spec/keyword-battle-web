@@ -48,6 +48,18 @@ function makeApi(fetchImpl: typeof fetch) {
 }
 
 describe("provider fee quote API boundary", () => {
+  it("accepts paired declaration provenance but rejects an unpaired marker", async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({
+      ...responseV2, asinSource: "user_declared", marketplaceSource: "report",
+    }), { status: 200 })).mockResolvedValueOnce(new Response(JSON.stringify({
+      ...responseV2, asinSource: "user_declared",
+    }), { status: 200 }));
+    const api = makeApi(fetchImpl);
+    await expect(api.refreshFeeQuote({ sessionId: SESSION_ID, requestId: REQUEST_ID }))
+      .resolves.toMatchObject({ asinSource: "user_declared", marketplaceSource: "report" });
+    await expect(api.refreshFeeQuote({ sessionId: SESSION_ID, requestId: REQUEST_ID }))
+      .rejects.toMatchObject({ code: "INVALID_API_RESPONSE" });
+  });
   it("refreshes the full flat v2 preflight response using only a request UUID", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify(responseV2), { status: 200 }));
     const api = makeApi(fetchImpl);
